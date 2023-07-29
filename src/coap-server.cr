@@ -51,7 +51,6 @@ class CoAP::Server < HTTP::Server
   protected def listen_socket(socket : UDPSocket, done : Channel(Nil))
     loop do
       message, client_addr = socket.receive
-
     end
   ensure
     done.send nil

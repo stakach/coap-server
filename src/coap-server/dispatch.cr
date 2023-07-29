@@ -1,6 +1,6 @@
 require "../coap-server"
 
-# Dispatch handles the low level communication layer
+# Dispatch handles buffering and retransmission
 #
 # it performs the following functions
 # * buffers requests (io buffering + block-wise transfers)
@@ -108,13 +108,13 @@ class CoAP::Server::Dispatch
   # messages received
   def buffer(ip_address : Socket::IPAddress, bytes : Bytes)
     buffer = if buff = @request_buffers.delete(ip_address)
-                buff.pos = buff.size
-                buff.write bytes
-                buff.rewind
-                buff
-              else
-                RequestBuffer.new(ip_address, bytes)
-              end
+               buff.pos = buff.size
+               buff.write bytes
+               buff.rewind
+               buff
+             else
+               RequestBuffer.new(ip_address, bytes)
+             end
 
     pos = 0
 
@@ -148,6 +148,24 @@ class CoAP::Server::Dispatch
   end
 
   protected def process_request(ip_address, message) : Nil
+    # check if client reset and clear any buffers
+    if message.type.reset?
+      @request_buffers.delete(ip_address)
+      @requests.reject! do |_key, req|
+        if req.ip_address == ip_address
+          @request_timeouts.delete req
+          true
+        end
+      end
+      @responses.reject! do |_key, resp|
+        if resp.ip_address == ip_address
+          @response_timeouts.delete resp
+          true
+        end
+      end
+      return
+    end
+
     options = message.options
 
     block2 = options.find(&.type.block2?).try &.block
@@ -167,7 +185,7 @@ class CoAP::Server::Dispatch
           cleanup = !block2.more?
           respond(ip_address, payload)
         else
-          respond ip_address, request_error(message, ResponseCode::BadOption, reason: "block2 out of bounds")
+          @response.send({ip_address, request_error(message, ResponseCode::BadOption, reason: "block2 out of bounds")})
           cleanup = true
         end
 
@@ -176,10 +194,10 @@ class CoAP::Server::Dispatch
           @response_timeouts.delete(token_id)
         end
       else
-        respond ip_address, request_error(message, ResponseCode::NotFound, reason: "response timeout")
+        @response.send({ip_address, request_error(message, ResponseCode::BadOption, reason: "block2 response timeout")})
       end
 
-    # is the request made up of multiple blocks?
+      # is the request made up of multiple blocks?
     elsif block1 && !(block1.number.zero? && !block1.more?)
       token_id = RequestResponse.token_id(ip_address, message)
 
@@ -194,27 +212,45 @@ class CoAP::Server::Dispatch
       if request
         if block1.more?
           # respond with acknowledgement
-          if message.type.confirmable?
-            ack = CoAP::Message.new
+          ack = CoAP::Message.new
+          if message.type.non_confirmable?
+            ack.type = :non_confirmable
+            ack.message_id = next_message_id
+          else
             ack.type = :acknowledgement
             ack.message_id = message.message_id
-            ack.status = CoAP::ResponseCode::Continue
-            ack.options = [block1.to_option(:block1)]
-            respond ip_address, ack
           end
+          ack.status = CoAP::ResponseCode::Continue
+          ack.options = [block1.to_option(:block1)]
+          @response.send({ip_address, ack})
         else
-          # TODO:: check we have all the parts of the request
-          # respond with RequestEntityIncomplete if not
-
           # cleanup and perform the request
           @requests.delete token_id
           @request_timeouts.delete request
+
+          # check we have all the parts of the request
+          if block1.number > (request.message.size - 1)
+            @response.send({
+              ip_address,
+              request_error(message, ResponseCode::RequestEntityIncomplete, reason: "block1 missing parts"),
+            })
+            return
+          end
+
           perform_request request
         end
       else
         respond ip_address, request_error(message, reason: "request timeout")
       end
     else # a normal simple request
+      if message.type.confirmable?
+        ack = CoAP::Message.new
+        ack.type = :acknowledgement
+        ack.message_id = message.message_id
+        ack.status = 0
+        @response.send({ip_address, ack})
+      end
+
       perform_request RequestResponse.new(ip_address, message)
     end
   end
@@ -223,11 +259,16 @@ class CoAP::Server::Dispatch
   def request_error(
     message : CoAP::Message,
     status_code : ResponseCode = ResponseCode::BadRequest,
-    reason : String? = nil,
+    reason : String? = nil
   )
     msg = CoAP::Message.new
-    msg.type = :non_confirmable
-    msg.message_id = next_message_id
+    if message.type.non_confirmable?
+      msg.type = :non_confirmable
+      msg.message_id = next_message_id
+    else
+      msg.type = :acknowledgement
+      msg.message_id = message.message_id
+    end
     msg.status_code = status_code
     msg.token = message.token
     if reason && reason.presence
