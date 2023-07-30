@@ -11,89 +11,24 @@ class CoAP::Server::Dispatch
   # This will be tracked as IP + token_id.hexstring
   alias TokenID = String
 
-  class RequestResponse
-    getter message : Array(CoAP::Message) = [] of CoAP::Message
-    getter initiated : Time::Span
-    getter ip_address : Socket::IPAddress
-
-    def initialize(@ip_address, @message, @token_id = nil)
-      @initiated = Time.monotonic
-    end
-
-    def initialize(@ip_address, message : CoAP::Message, @token_id = nil)
-      @message = [message]
-      @initiated = Time.monotonic
-    end
-
-    def self.token_id(ip_address : Socket::IPAddress, message : CoAP::Message)
-      "#{ip_address}~#{message.token.hexstring}"
-    end
-
-    getter token_id : String do
-      self.class.token_id(@ip_address, @message.first)
-    end
-
-    def insert(message : CoAP::Message, block : Option::Block)
-      messages = @message
-      index = 0
-      new_number = block.number
-      replace = false
-
-      messages.each do |msg|
-        block_no = msg.options.find!(&.type.block1?).block.number
-
-        if block_no == new_number
-          replace = true
-          break
-        end
-
-        break if block_no > new_number
-        index += 1
-      end
-
-      if replace
-        messages[index] = message
-      else
-        messages.insert(index, message)
-      end
-    end
-  end
-
-  struct RequestBuffer
-    property io : IO::Memory
-    getter initiated : Time::Span
-    getter ip_address : Socket::IPAddress
-
-    def initialize(@ip_address, bytes : Bytes)
-      @io = IO::Memory.new(bytes.size)
-      @io.write bytes
-      @io.rewind
-      @initiated = Time.monotonic
-    end
-
-    forward_missing_to @io
-
-    def eof?
-      @io.pos == @io.size
-    end
-  end
+  # the max time a message can take to be received or sent
+  MAX_TRANSMIT_SPAN = 45.seconds
 
   # this stores any incoming requests if we don't have the full request data
   @request_buffers = {} of Socket::IPAddress => RequestBuffer
-
-  # this stores incoming block-wise transfers
-  @requests = {} of TokenID => RequestResponse
-  @request_timeouts = Deque(RequestResponse).new
-
-  # this stores outgoing block-wise transfers
-  @responses = {} of TokenID => RequestResponse
-  @response_timeouts = Deque(RequestResponse).new
 
   # new requests are sent down this channel once fully received
   getter request = Channel(RequestResponse).new(1)
 
   # responses are sent via this channel
   getter response = Channel(Tuple(Socket::IPAddress, CoAP::Message)).new(1)
+
+  # manage timeouts and retransmission of confirmable messages
+  def initialize
+    @confirmations = ConfirmationTracking.new(@response)
+    @block_wise_requests = BlockWiseTracking.new
+    @block_wise_response = BlockWiseTracking.new
+  end
 
   @message_id : UInt16 = rand(UInt16::MAX).to_u16
 
@@ -136,7 +71,7 @@ class CoAP::Server::Dispatch
     rescue error
       # we'll buffer as we expect more data (possible ip fragmentation)
       if IO::EOFError.in?({error.class, error.cause.class})
-        Log.trace { "buffering message: #{error.message}" }
+        Log.trace { "buffering message from #{ip_address}: #{error.message}" }
         bytes = buffer.to_slice[pos..-1]
         @request_buffers[ip_address] = RequestBuffer.new(ip_address, bytes)
       else
@@ -150,19 +85,14 @@ class CoAP::Server::Dispatch
   protected def process_request(ip_address, message) : Nil
     # check if client reset and clear any buffers
     if message.type.reset?
-      @request_buffers.delete(ip_address)
-      @requests.reject! do |_key, req|
-        if req.ip_address == ip_address
-          @request_timeouts.delete req
-          true
-        end
-      end
-      @responses.reject! do |_key, resp|
-        if resp.ip_address == ip_address
-          @response_timeouts.delete resp
-          true
-        end
-      end
+      @confirmations.reset ip_address
+      @block_wise_requests.reset ip_address
+      @block_wise_response.reset ip_address
+      return
+    end
+
+    if message.type.acknowledgement?
+      @confirmations.acknowledged(ip_address, message)
       return
     end
 
@@ -179,33 +109,25 @@ class CoAP::Server::Dispatch
 
     # is this a request for a part of the response we have buffered
     if block2
-      token_id = RequestResponse.token_id(ip_address, message)
-      if response = @responses[token_id]?
+      if response = @block_wise_response.lookup(ip_address, message)
         if payload = response.message[block2.number]?
-          cleanup = !block2.more?
+          cleanup = !payload.options.find!(&.type.block2?).block.more?
           respond(ip_address, payload)
         else
           @response.send({ip_address, request_error(message, ResponseCode::BadOption, reason: "block2 out of bounds")})
           cleanup = true
         end
 
-        if cleanup
-          @responses.delete(token_id)
-          @response_timeouts.delete(token_id)
-        end
+        @block_wise_response.cleanup(response) if cleanup
       else
         @response.send({ip_address, request_error(message, ResponseCode::BadOption, reason: "block2 response timeout")})
       end
 
       # is the request made up of multiple blocks?
     elsif block1 && !(block1.number.zero? && !block1.more?)
-      token_id = RequestResponse.token_id(ip_address, message)
-
       if block1.number.zero?
-        request = RequestResponse.new(ip_address, message, token_id)
-        @requests[token_id] = request
-        @request_timeouts << request
-      elsif request = @requests[token_id]?
+        request = @block_wise_requests.buffer_request(ip_address, message)
+      elsif request = @block_wise_requests.lookup(ip_address, message)
         request.insert(message, block1)
       end
 
@@ -225,8 +147,7 @@ class CoAP::Server::Dispatch
           @response.send({ip_address, ack})
         else
           # cleanup and perform the request
-          @requests.delete token_id
-          @request_timeouts.delete request
+          @block_wise_requests.cleanup request
 
           # check we have all the parts of the request
           if block1.number > (request.message.size - 1)
@@ -279,14 +200,15 @@ class CoAP::Server::Dispatch
 
   # TODO:: check if an ack is required for the response and retransmit as required
   def respond(ip_address : Socket::IPAddress, message : CoAP::Message)
+    if message.type.confirmable?
+      # buffer and ensure we get an ACK
+      @confirmations.register(ip_address, message)
+    end
     @response.send({ip_address, message})
   end
 
   def respond(response : RequestResponse)
-    if response.message.size > 0
-      @responses[response.token_id] = response
-      @response_timeouts << response
-    end
+    @block_wise_response.buffer_request(response) if response.message.size > 1
     respond(response.ip_address, response.message.first)
   end
 
@@ -296,3 +218,5 @@ class CoAP::Server::Dispatch
     @request.send request
   end
 end
+
+require "./dispatch/*"

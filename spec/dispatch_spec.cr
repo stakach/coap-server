@@ -55,7 +55,7 @@ describe CoAP::Server do
     dispatch.buffer ip_address, message.to_slice
 
     (!!get_request.call).should be_false
-    ip, response = get_reponse.call.not_nil!
+    ip, response = get_reponse.call || raise "response expected"
     ip.should eq ip_address
     response.type.acknowledgement?.should be_true
     response.status.continue?.should be_true
@@ -68,7 +68,7 @@ describe CoAP::Server do
     message.options << CoAP::Option::Block.new(1, true).to_option(:block1)
     dispatch.buffer ip_address, message.to_slice
 
-    ip, response = get_reponse.call.not_nil!
+    ip, response = get_reponse.call || raise "response expected"
     ip.should eq ip_address
     response.type.acknowledgement?.should be_true
     response.status.continue?.should be_true
@@ -82,10 +82,41 @@ describe CoAP::Server do
     dispatch.buffer ip_address, message.to_slice
 
     get_reponse.call.should be_nil
-    request = get_request.call.not_nil!
+    request = get_request.call || raise "request expected"
     request.message.size.should eq 3
   end
 
   it "buffers and handles a block-wise response" do
+    message = CoAP::Message.new
+    message.message_id = 0_u16
+    message.token = token
+    message.status = :content
+    message.options << CoAP::Option::Block.new(0, true).to_option(:block2)
+    response = CoAP::Server::Dispatch::RequestResponse.new(ip_address, message)
+
+    message = CoAP::Message.new
+    message.message_id = 1_u16
+    message.token = token
+    message.status = :content
+    message.options << CoAP::Option::Block.new(1, false).to_option(:block2)
+    response.message << message
+
+    # returns the first part of the response
+    dispatch.respond response
+    _ip, resp = get_reponse.call || raise "response expected"
+    resp.should eq response.message.first?
+
+    # request the next part of the response
+    message = CoAP::Message.new
+    message.message_id = 2_u16
+    message.token = token
+    message.method = :get
+    message.uri = URI.parse("coap://127.0.0.1/path/method?payload")
+    message.options << CoAP::Option::Block.new(1, false).to_option(:block2)
+    dispatch.buffer ip_address, message.to_slice
+
+    get_request.call.should be_nil
+    _ip, resp = get_reponse.call || raise "response expected"
+    resp.should eq response.message[-1]
   end
 end
