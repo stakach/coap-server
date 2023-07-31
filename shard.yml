@@ -6,6 +6,10 @@ dependencies:
     github: spider-gazelle/coap
     branch: master
 
+development_dependencies:
+  timecop:
+    github: crystal-community/timecop.cr
+
 authors:
   - Stephen von Takach <steve@place.tech>
 

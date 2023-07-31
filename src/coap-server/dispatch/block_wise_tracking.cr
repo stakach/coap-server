@@ -10,7 +10,7 @@ class CoAP::Server::Dispatch::BlockWiseTracking
   end
 
   def finalize
-    stop
+    close
   end
 
   def buffer_request(ip_address : Socket::IPAddress, message : CoAP::Message) : RequestResponse
@@ -46,8 +46,8 @@ class CoAP::Server::Dispatch::BlockWiseTracking
 
   protected def timeout_loop : Nil
     loop do
-      break unless @running
       sleep 0.5
+      break unless @running
 
       now = Time.monotonic
       @access_lock.synchronize do
@@ -61,7 +61,7 @@ class CoAP::Server::Dispatch::BlockWiseTracking
     end
   end
 
-  def stop
+  def close
     @running = false
   end
 end

@@ -1,4 +1,5 @@
 require "spec"
+require "timecop"
 require "../src/coap-server"
 
 ::Log.setup("*", :trace)

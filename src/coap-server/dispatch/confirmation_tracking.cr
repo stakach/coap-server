@@ -14,7 +14,7 @@ class CoAP::Server::Dispatch::ConfirmationTracking
   end
 
   def finalize
-    stop
+    close
   end
 
   def register(ip_address : Socket::IPAddress, message : CoAP::Message) : Nil
@@ -63,14 +63,14 @@ class CoAP::Server::Dispatch::ConfirmationTracking
 
   protected def timeout_loop : Nil
     loop do
-      break if @timeout_tick.closed?
       sleep 0.5
+      break if @timeout_tick.closed?
       @timeout_tick.send Time.monotonic
     end
   rescue Channel::ClosedError
   end
 
-  def stop
+  def close
     @register.close
     @reset.close
     @acknowledged.close

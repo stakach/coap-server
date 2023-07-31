@@ -8,9 +8,6 @@ require "../coap-server"
 # * handles confirmations and acknowledgements
 # * handles retransmission
 class CoAP::Server::Dispatch
-  # This will be tracked as IP + token_id.hexstring
-  alias TokenID = String
-
   # the max time a message can take to be received or sent
   MAX_TRANSMIT_SPAN = 45.seconds
 
@@ -28,6 +25,12 @@ class CoAP::Server::Dispatch
     @confirmations = ConfirmationTracking.new(@response)
     @block_wise_requests = BlockWiseTracking.new
     @block_wise_response = BlockWiseTracking.new
+  end
+
+  def close
+    @confirmations.close
+    @block_wise_requests.close
+    @block_wise_response.close
   end
 
   @message_id : UInt16 = rand(UInt16::MAX).to_u16
@@ -198,7 +201,7 @@ class CoAP::Server::Dispatch
     msg
   end
 
-  # TODO:: check if an ack is required for the response and retransmit as required
+  # check if an ack is required for the response and retransmit as required
   def respond(ip_address : Socket::IPAddress, message : CoAP::Message)
     if message.type.confirmable?
       # buffer and ensure we get an ACK
@@ -207,6 +210,7 @@ class CoAP::Server::Dispatch
     @response.send({ip_address, message})
   end
 
+  # block-wise request response
   def respond(response : RequestResponse)
     @block_wise_response.buffer_request(response) if response.message.size > 1
     respond(response.ip_address, response.message.first)
