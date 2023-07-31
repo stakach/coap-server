@@ -1,7 +1,9 @@
-struct CoAP::Server::Dispatch::RequestBuffer
+struct CoAP::Server::Dispatch::IOBuffer
   property io : IO::Memory
   getter initiated : Time::Span
   getter ip_address : Socket::IPAddress
+
+  PROCESSING_DELAY = 2.seconds
 
   def initialize(@ip_address, bytes : Bytes)
     @io = IO::Memory.new(bytes.size)
@@ -14,5 +16,9 @@ struct CoAP::Server::Dispatch::RequestBuffer
 
   def eof?
     @io.pos == @io.size
+  end
+
+  def timed_out?(now = Time.monotonic) : Bool
+    (now - @initiated) >= PROCESSING_DELAY
   end
 end

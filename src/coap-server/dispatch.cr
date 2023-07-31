@@ -12,7 +12,8 @@ class CoAP::Server::Dispatch
   MAX_TRANSMIT_SPAN = 45.seconds
 
   # this stores any incoming requests if we don't have the full request data
-  @request_buffers = {} of Socket::IPAddress => RequestBuffer
+  @io_buffers = {} of Socket::IPAddress => IOBuffer
+  @io_mutex = Mutex.new
 
   # new requests are sent down this channel once fully received
   getter request = Channel(RequestResponse).new(1)
@@ -31,6 +32,26 @@ class CoAP::Server::Dispatch
     @confirmations.close
     @block_wise_requests.close
     @block_wise_response.close
+    @request.close
+    @response.close
+  end
+
+  def closed?
+    @request.closed?
+  end
+
+  def timeout_io_buffers
+    loop do
+      sleep 2
+      break if @request.closed?
+
+      now = Time.monotonic
+      @io_mutex.synchronize do
+        @io_buffers.reject! do |_lookup, io|
+          io.timed_out?(now)
+        end
+      end
+    end
   end
 
   @message_id : UInt16 = rand(UInt16::MAX).to_u16
@@ -45,20 +66,19 @@ class CoAP::Server::Dispatch
   # buffer incoming data from an endpoint and process any
   # messages received
   def buffer(ip_address : Socket::IPAddress, bytes : Bytes)
-    buffer = if buff = @request_buffers.delete(ip_address)
-               buff.pos = buff.size
-               buff.write bytes
-               buff.rewind
-               buff
-             else
-               RequestBuffer.new(ip_address, bytes)
-             end
+    if buff = @io_mutex.synchronize { @io_buffers.delete(ip_address) }
+      io = buff.io
+      io.pos = io.size
+    else
+      io = IO::Memory.new(bytes.size)
+    end
 
+    io.write bytes
+    io.rewind
     pos = 0
 
     begin
       loop do
-        io = buffer.io
         header = io.read_bytes(CoAP::Header)
         if header.version != 1_u8
           raise "unknown CoAP version #{header.version}"
@@ -69,17 +89,17 @@ class CoAP::Server::Dispatch
         process_request(ip_address, io.read_bytes(CoAP::Message))
 
         pos = io.pos
-        break if buffer.eof?
+        break if pos == io.size
       end
     rescue error
       # we'll buffer as we expect more data (possible ip fragmentation)
       if IO::EOFError.in?({error.class, error.cause.class})
         Log.trace { "buffering message from #{ip_address}: #{error.message}" }
-        bytes = buffer.to_slice[pos..-1]
-        @request_buffers[ip_address] = RequestBuffer.new(ip_address, bytes)
+        bytes = io.to_slice[pos..-1]
+        @io_mutex.synchronize { @io_buffers[ip_address] = IOBuffer.new(ip_address, bytes) }
       else
         # we'll throw away the rest of this buffer
-        @request_buffers.delete ip_address
+        @io_mutex.synchronize { @io_buffers.delete ip_address }
         Log.warn(exception: error) { "while processing request from #{ip_address}" }
       end
     end
