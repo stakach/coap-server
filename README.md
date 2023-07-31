@@ -7,7 +7,7 @@ Provides an interface for handling and responding to CoAP requests.
   2. provides completed requests for processing
   3. buffers responses
   4. handles sending the response to the client
-* Processor
+* Processor handles discrete requests
   1. takes a complete request
   2. transforms it for processing (HTTP request)
   3. response received from the request pipline
